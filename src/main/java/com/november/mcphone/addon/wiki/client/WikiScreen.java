@@ -32,6 +32,16 @@ public class WikiScreen extends GuiScreen {
     private static final double SCALE = 0.8;
     private static final int BAR = 22;
 
+    /**
+     * CEF 引导页（MCEF jar 内置本地页，mod:// scheme 恒注册）。
+     * F10 示例浏览器在本实例唯一验证可行的路径是「先用本地页创建 → 首帧渲染后
+     * 再导航到外链」；直接用外链 URL 创建的 OSR 浏览器首帧不上传纹理（纯白），
+     * 疑似 CEF 3.2171 视口初始化竞态。故创建时先挂引导页，渲染稳定后 loadURL。
+     */
+    private static final String BOOTSTRAP_URL = "mod://mcef/home.html";
+    /** 首帧等待上限（帧）：约 4~6 秒，防反射探测不可用时永久白屏。 */
+    private static final int BOOTSTRAP_MAX_FRAMES = 120;
+
     private volatile WikiHandle browser;
     private int viewW;
     private int viewH;
@@ -42,6 +52,10 @@ public class WikiScreen extends GuiScreen {
     private boolean lastInPage;
     private int pressedCefBtn = -1;
     private String shownUrl = "";
+
+    /** 引导状态：BOOTSTRAP（本地页，等首帧）→ 每帧尝试 loadURL(pendingUrl)。 */
+    private boolean bootstrapping;
+    private int bootstrapFrames;
 
     /** 当前打开的 WikiScreen（供看门狗关闭）。 */
     private static WikiScreen current;
@@ -113,11 +127,14 @@ public class WikiScreen extends GuiScreen {
             shownUrl = url;
             McefBridge.detect();
             if (McefBridge.available()) {
-                browser = McefBridge.create(url);
+                // 先用内置本地页创建（F10 验证过的安全路径），首帧后再导航到目标页
+                browser = McefBridge.create(BOOTSTRAP_URL);
                 if (browser == null) {
                     createError = McefBridge.failReason();
                 } else {
                     browser.resize(viewW, viewH);
+                    bootstrapping = true;
+                    bootstrapFrames = 0;
                 }
             }
         } else {
@@ -125,6 +142,24 @@ public class WikiScreen extends GuiScreen {
             if (b != null) {
                 b.resize(viewW, viewH);
             }
+        }
+    }
+
+    /** 引导推进：首帧（或超时）后导航到目标页；pendingUrl 只消费一次。 */
+    private void tickBootstrap() {
+        if (!bootstrapping) {
+            return;
+        }
+        WikiHandle b = browser;
+        if (b == null) {
+            bootstrapping = false;
+            return;
+        }
+        bootstrapFrames++;
+        if (b.hasPaintedFrame() || bootstrapFrames >= BOOTSTRAP_MAX_FRAMES) {
+            bootstrapping = false;
+            String url = pendingUrl != null ? pendingUrl : WikiAddon.WIKI_HOME;
+            b.loadURL(url);
         }
     }
 
@@ -159,6 +194,7 @@ public class WikiScreen extends GuiScreen {
 
     @Override
     public void drawScreen(int mx, int my, float pt) {
+        tickBootstrap();
         drawRect(0, 0, this.width, this.height, 0xD0141414);
 
         // ---- 顶部工具栏 ----
@@ -176,8 +212,9 @@ public class WikiScreen extends GuiScreen {
         drawRect(46, 5, 64, BAR - 5, 0xFF4A4A4A);
         fontRendererObj.drawStringWithShadow("H", 52, 8, 0xFFFFFF);
 
-        // 只读地址显示（70..width-56）：节流跟随真实 URL，变化即记历史
-        if (b != null && System.currentTimeMillis() - lastUrlSync > 500) {
+        // 只读地址显示（70..width-56）：节流跟随真实 URL，变化即记历史。
+        // 引导期间 CEF 还停在 mod:// 引导页，跳过同步以免污染历史/上次页面。
+        if (b != null && !bootstrapping && System.currentTimeMillis() - lastUrlSync > 500) {
             lastUrlSync = System.currentTimeMillis();
             String cur = b.getURL();
             if (cur != null && !cur.isEmpty() && !cur.equals(shownUrl)) {

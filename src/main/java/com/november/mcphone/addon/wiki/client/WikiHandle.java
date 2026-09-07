@@ -29,6 +29,11 @@ public final class WikiHandle {
     private final Method injectMouseMove, injectMouseButton, injectMouseWheel;
     private final Method injectKeyPressed, injectKeyTyped, injectKeyReleased;
 
+    // 首帧探测：CefRenderer.view_width_/view_height_（实例版 MCEF 0.6 无 getter，
+    // 只能反射私有字段；render() 在二者为 0 时直接返回，>0 即已有真实帧上传纹理）。
+    private final Object renderer;
+    private final java.lang.reflect.Field fViewW, fViewH;
+
     WikiHandle(Object browser) throws Exception {
         this.browser = browser;
         Class<?> c = browser.getClass();
@@ -46,6 +51,25 @@ public final class WikiHandle {
         injectKeyPressed = c.getMethod("injectKeyPressed", char.class, int.class);
         injectKeyTyped = c.getMethod("injectKeyTyped", char.class, int.class);
         injectKeyReleased = c.getMethod("injectKeyReleased", char.class, int.class);
+
+        Object r = null;
+        java.lang.reflect.Field fw = null, fh = null;
+        try {
+            java.lang.reflect.Field rf = c.getDeclaredField("renderer_");
+            rf.setAccessible(true);
+            r = rf.get(browser);
+            if (r != null) {
+                fw = r.getClass().getDeclaredField("view_width_");
+                fw.setAccessible(true);
+                fh = r.getClass().getDeclaredField("view_height_");
+                fh.setAccessible(true);
+            }
+        } catch (Throwable t) {
+            r = null; // 探测不可用时走调用方的超时兜底
+        }
+        this.renderer = r;
+        this.fViewW = fw;
+        this.fViewH = fh;
     }
 
     public void resize(int w, int h) {
@@ -79,6 +103,21 @@ public final class WikiHandle {
             return (Integer) getTextureID.invoke(browser);
         } catch (Throwable t) {
             return 0;
+        }
+    }
+
+    /**
+     * CEF 是否已向 GL 纹理上传过真实帧（view_width_/view_height_ > 0）。
+     * 反射不可用时返回 true（调用方走超时兜底）。
+     */
+    public boolean hasPaintedFrame() {
+        if (renderer == null || fViewW == null || fViewH == null) {
+            return true;
+        }
+        try {
+            return fViewW.getInt(renderer) > 0 && fViewH.getInt(renderer) > 0;
+        } catch (Throwable t) {
+            return true;
         }
     }
 
