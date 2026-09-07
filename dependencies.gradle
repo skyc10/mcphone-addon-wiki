@@ -1,0 +1,12 @@
+/*
+ * 附属（mcphone_wiki）依赖说明：
+ *  - mcphone：编译期需要 api/IPhoneApp、api/PhoneApi、client/scene/PhoneUi。
+ *    运行时由实例 mods 里的 mcphone-1.0.0.jar 提供，因此用 compileOnly。
+ *  - Qz-UILib：PhoneUi 场景树底层框架，同样 compileOnly（运行时由 qz_uilib-4.8.0.jar 提供）。
+ *  - MCEF：全程反射调用（技术红线），不进编译期依赖。
+ *    不依赖 WebDisplays：页面由 MCEF 内嵌 Chromium 离屏渲染到全屏虚拟界面。
+ */
+dependencies {
+    compileOnly(files(new File(rootDir, "libs/mcphone-1.0.0.jar").absolutePath))
+    compileOnly(files(new File(rootDir, "libs/qz_uilib-dev.jar").absolutePath))
+}

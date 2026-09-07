@@ -1,0 +1,14 @@
+app.mcphone_wiki.wiki=Wiki
+label.mcphone_wiki.search=Search
+btn.mcphone_wiki.search=Search
+btn.mcphone_wiki.open=Open Wiki
+btn.mcphone_wiki.del=Del
+label.mcphone_wiki.bookmarks=Bookmarks
+label.mcphone_wiki.history=History
+msg.mcphone_wiki.loading=Loading page...
+msg.mcphone_wiki.no_bookmarks=No bookmarks yet.
+msg.mcphone_wiki.no_history=No history yet.
+err.mcphone_wiki.missing_mcef=MCEF browser engine unavailable (MCEF + CEF real mode required).
+err.mcphone_wiki.create_failed=Failed to create the browser engine.
+err.mcphone_wiki.no_keyword=Please enter a keyword first.
+err.mcphone_wiki.no_url=Page URL is empty.

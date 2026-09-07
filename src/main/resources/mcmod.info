@@ -1,0 +1,20 @@
+[
+{
+	"modid": "mcphone_wiki",
+	"name": "MCphone Addon - GTNH Wiki",
+	"description": "MCphone 附属：GTNH 中文维基 App。前置依赖：MCEF（内嵌 Chromium，真实浏览器模式）。点击手机 Wiki 图标打开全屏虚拟界面浏览 gtnh.huijiwiki.com，支持站内搜索、书签、历史与上次页面恢复。Addon for MCphone: browse the GTNH Chinese wiki (gtnh.huijiwiki.com) in a fullscreen virtual browser rendered by MCEF/CEF - search, bookmarks and history included.",
+	"version": "${modVersion}",
+	"mcversion": "${minecraftVersion}",
+	"url": "",
+	"updateUrl": "",
+	"authorList": ["skyc10"],
+	"credits": "",
+	"logoFile": "",
+	"screenshots": [],
+	"parent": "",
+	"requiredMods": ["mcphone"],
+	"dependencies": ["mcphone"],
+	"dependants": [],
+	"useDependencyInformation": true
+}
+]
