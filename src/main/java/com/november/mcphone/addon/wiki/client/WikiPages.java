@@ -1,7 +1,7 @@
 package com.november.mcphone.addon.wiki.client;
 
+import java.io.UnsupportedEncodingException;
 import java.net.URLEncoder;
-import java.nio.charset.StandardCharsets;
 import java.util.List;
 
 import net.minecraft.util.StatCollector;
@@ -129,8 +129,13 @@ final class WikiPages {
             ui.toast(tr("err.mcphone_wiki.no_keyword"));
             return;
         }
-        String url = WikiAddon.WIKI_SEARCH + URLEncoder.encode(kw, StandardCharsets.UTF_8);
-        openUrl(ui, url);
+        String encoded;
+        try {
+            encoded = URLEncoder.encode(kw, "UTF-8");
+        } catch (UnsupportedEncodingException e) {
+            return; // UTF-8 恒存在，不会走到这里
+        }
+        openUrl(ui, WikiAddon.WIKI_SEARCH + encoded);
     }
 
     /** 从管理页打开页面：关闭手机 → 全屏维基屏。 */
