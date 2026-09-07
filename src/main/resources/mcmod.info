@@ -5,7 +5,7 @@
 	"description": "MCphone addon: GTNH Chinese wiki app. Click the Wiki icon on the phone to open a fullscreen virtual browser (MCEF/CEF) showing gtnh.huijiwiki.com - in-wiki search, bookmarks, history and last-page restore included. Requires MCEF real browser mode. In-game text is Chinese/English (see lang files).",
 	"version": "${modVersion}",
 	"mcversion": "${minecraftVersion}",
-	"url": "",
+	"url": "https://github.com/skyc10/mcphone-addon-wiki",
 	"updateUrl": "",
 	"authorList": ["skyc10"],
 	"credits": "",

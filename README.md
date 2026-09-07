@@ -37,6 +37,13 @@ MCphone 附属 mod：**GTNH 中文维基 App**（id=`wiki`）。在 MCphone 手�
 > （`MCEF-1.7.10-patched.jar`，详见该项目的 MCEF-PATCH-NOTES.md）。
 > MCEF 缺失或处于虚拟模式时，App 显示前置缺失提示页，绝不崩溃。
 
+**浏览器引导机制**：打开维基屏时先用 MCEF 内置本地页 `mod://mcef/home.html`
+创建 OSR 浏览器并完成首帧渲染，然后才导航到维基页面。在 CEF 3.2171 上直接用
+外链 URL 创建浏览器会因视口初始化竞态导致首帧永不上传（界面纯白）；
+「本地页引导 → 首帧后 loadURL」是 F10 示例浏览器实测可靠的同款路径。
+首帧探测反射 `CefRenderer.view_width_/view_height_`（>0 即有真实帧上传），
+探测不可用时按帧数超时兜底，引导页不会进入书签/历史/上次页面记录。
+
 安装：把 `mcphone-addon-wiki-1.0.0.jar` 放进实例 `mods/`（与 mcphone、qz_uilib、MCEF 同目录）。
 
 ## 构建
