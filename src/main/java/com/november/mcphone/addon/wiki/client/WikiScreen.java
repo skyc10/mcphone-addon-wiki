@@ -60,6 +60,8 @@ public class WikiScreen extends GuiScreen {
     /** 当前打开的 WikiScreen（供看门狗关闭）。 */
     private static WikiScreen current;
 
+    private long stuckSince; // textureId()==0 且 MCEF 可用的起始时刻（0=未计时）
+
     public WikiScreen(String url) {
         this.pendingUrl = url;
         current = this;
@@ -176,18 +178,27 @@ public class WikiScreen extends GuiScreen {
         }
     }
 
-    /** 看门狗用：游戏退出时关掉还活着的浏览器。 */
+    /**
+     * 退出看门狗调用：异步关闭我们打开的浏览器。
+     *
+     * <p>close() 最终走到 JCEF 的 native n_Close，MC 主循环停止后 CEF 消息泵
+     * 已死，该调用会永久阻塞——绝不能在看门狗线程上同步执行（同步调用会把
+     * 看门狗卡死、导致强杀逻辑永远没跑到的）。放到守护线程里，阻塞也只阻塞
+     * 它自己，不影响看门狗的扫描与强杀。</p>
+     */
     static void forceClose() {
         WikiScreen s = current;
-        if (s != null) {
-            WikiHandle b = s.browser;
-            if (b != null) {
-                s.browser = null;
-                try {
-                    b.close();
-                } catch (Throwable ignored) {}
-            }
+        if (s == null) {
+            return;
         }
+        WikiHandle b = s.browser;
+        if (b == null) {
+            return;
+        }
+        s.browser = null;
+        Thread t = new Thread(() -> b.close(), "mcphone_wiki-async-close");
+        t.setDaemon(true);
+        t.start();
     }
 
     // ===================== 渲染 =====================
@@ -201,6 +212,11 @@ public class WikiScreen extends GuiScreen {
         drawRect(0, 0, this.width, BAR, 0xF02B2B2B);
 
         WikiHandle b = browser;
+        if (b != null) {
+            // MCEF 上游 CefRenderer.initialize() 孤儿化兜底：Client thread 渲染
+            // 路径上有 GL context，是执行 glGenTextures 的安全时机（内部只跑一次）。
+            b.ensureRendererInitialized();
+        }
 
         // 后退 ◀ (6..24)
         drawRect(6, 5, 24, BAR - 5, b != null ? 0xFF4A4A4A : 0xFF383838);
@@ -254,6 +270,14 @@ public class WikiScreen extends GuiScreen {
                 detail = createError;
             } else if (McefBridge.available()) {
                 msg = StatCollector.translateToLocal("msg.mcphone_wiki.loading");
+                // 超时诊断：CEF 存活但纹理始终为 0 —— 兜底已跑过仍未生效，
+                // 提示可能是 MCEF 上游 bug（不自动重试，避免刷屏）。
+                long now = System.currentTimeMillis();
+                if (stuckSince == 0) {
+                    stuckSince = now;
+                } else if (now - stuckSince > 15000) {
+                    detail = StatCollector.translateToLocal("msg.mcphone_wiki.texture_stuck");
+                }
             } else {
                 msg = StatCollector.translateToLocal("err.mcphone_wiki.missing_mcef");
                 String r = McefBridge.failReason();

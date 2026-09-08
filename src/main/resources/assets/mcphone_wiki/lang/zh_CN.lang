@@ -6,6 +6,7 @@ btn.mcphone_wiki.del=删
 label.mcphone_wiki.bookmarks=书签
 label.mcphone_wiki.history=历史记录
 msg.mcphone_wiki.loading=正在加载页面…
+msg.mcphone_wiki.texture_stuck=浏览器纹理 15 秒仍未渲染，已尝试兜底初始化；若页面持续空白请把 fml-client-latest.log 反馈给作者。
 msg.mcphone_wiki.no_bookmarks=还没有书签。
 msg.mcphone_wiki.no_history=还没有历史记录。
 err.mcphone_wiki.missing_mcef=MCEF 浏览器内核不可用（需要 MCEF + CEF 真实模式）。

@@ -6,6 +6,7 @@ btn.mcphone_wiki.del=Del
 label.mcphone_wiki.bookmarks=Bookmarks
 label.mcphone_wiki.history=History
 msg.mcphone_wiki.loading=Loading page...
+msg.mcphone_wiki.texture_stuck=Browser texture not rendered for 15 seconds; fallback initialization attempted. If the page stays blank, please send fml-client-latest.log to the author.
 msg.mcphone_wiki.no_bookmarks=No bookmarks yet.
 msg.mcphone_wiki.no_history=No history yet.
 err.mcphone_wiki.missing_mcef=MCEF browser engine unavailable (MCEF + CEF real mode required).

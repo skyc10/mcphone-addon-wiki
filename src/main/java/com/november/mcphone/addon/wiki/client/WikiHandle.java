@@ -31,8 +31,17 @@ public final class WikiHandle {
 
     // 首帧探测：CefRenderer.view_width_/view_height_（实例版 MCEF 0.6 无 getter，
     // 只能反射私有字段；render() 在二者为 0 时直接返回，>0 即已有真实帧上传纹理）。
+    // 同一 renderer_ 实例兼作纹理初始化兜底目标（见 rendererInit 注释），探测共享。
     private final Object renderer;
     private final java.lang.reflect.Field fViewW, fViewH;
+
+    // ---- MCEF 上游纹理初始化兜底 ----
+    // CefRenderer.initialize()（glGenTextures 的唯一赋值点）在 MCEF 0.6/0.7 jar
+    // 中被孤儿化、无任何调用者，导致纹理 id 恒 0、画面永远停在 loading。
+    // 这里只探测方法是否存在并缓存，真正调用延迟到渲染线程（有 GL context 时）
+    // 由 ensureRendererInitialized() 执行；rendererInitialized 含失败也只跑一次。
+    private final Method rendererInit;
+    private boolean rendererInitialized;
 
     WikiHandle(Object browser) throws Exception {
         this.browser = browser;
@@ -70,6 +79,26 @@ public final class WikiHandle {
         this.renderer = r;
         this.fViewW = fw;
         this.fViewH = fh;
+
+        // 探测 MCEF 0.6/0.7 上游 bug：CefRenderer.initialize()（glGenTextures 的
+        // 唯一赋值点）在上游被孤儿化、无任何调用者，导致纹理 id 恒 0。复用上面
+        // renderer_ 的探测结果（不重复反射取字段），只查找 initialize() 并缓存。
+        Method init = null;
+        if (r != null) {
+            try {
+                init = r.getClass().getDeclaredMethod("initialize");
+                init.setAccessible(true);
+            } catch (Throwable t) {
+                // 其他 MCEF 版本可能已自行修复，打一行日志后不再尝试；
+                // 首帧探测结果（renderer/fViewW/fViewH）保持不动。
+                System.out.println("[mcphone_wiki] renderer init shim not applicable: " + t);
+                init = null;
+            }
+        }
+        this.rendererInit = init;
+        if (init != null) {
+            System.out.println("[mcphone_wiki] OSR renderer texture-init shim armed");
+        }
     }
 
     public void resize(int w, int h) {
@@ -97,12 +126,54 @@ public final class WikiHandle {
         }
     }
 
-    /** 当前页面纹理 ID；未绘制首帧时为 0。 */
+    /**
+     * 当前页面纹理 ID；未绘制首帧时为 0。
+     *
+     * <p>MCEF 上游 bug 兜底：CefRenderer.initialize()（纹理 id 的唯一赋值点
+     * glGenTextures）在 MCEF jar 中无任何调用者，getTextureID() 恒 0。首次在
+     * 此读到 0 且兜底尚未执行时调用一次 initialize()。本方法只在
+     * WikiScreen.drawScreen（Client thread 渲染路径，有 GL context）中被调用，
+     * 因此在这里执行 glGenTextures 是线程安全的。</p>
+     */
     public int textureId() {
         try {
-            return (Integer) getTextureID.invoke(browser);
+            int id = (Integer) getTextureID.invoke(browser);
+            if (id == 0) {
+                ensureRendererInitialized();
+                id = (Integer) getTextureID.invoke(browser);
+            }
+            return id;
         } catch (Throwable t) {
+            System.err.println("[mcphone_wiki] getTextureID failed: " + t);
             return 0;
+        }
+    }
+
+    /**
+     * MCEF 上游纹理初始化兜底（反射调用 CefRenderer.initialize() 一次）。
+     *
+     * <p>调用时机约束：必须在持有 GL context 的线程上执行（glGenTextures 依赖
+     * 当前 context）。WikiScreen.drawScreen 在 Client thread 渲染路径上调用
+     * 本方法与 {@link #textureId()}，满足约束。无论成败只执行一次：失败后不再
+     * 重试，避免每帧反射调用刷屏。</p>
+     */
+    void ensureRendererInitialized() {
+        if (rendererInitialized || rendererInit == null) {
+            return;
+        }
+        rendererInitialized = true;
+        try {
+            rendererInit.invoke(renderer);
+            int id = (Integer) getTextureID.invoke(browser);
+            if (id != 0) {
+                System.out.println("[mcphone_wiki] CefRenderer.initialize() invoked (texture id=" + id + ")");
+            } else {
+                System.out.println(
+                    "[mcphone_wiki] WARN: CefRenderer.initialize() invoked but texture id still 0"
+                        + " (GL context unavailable? giving up, no retry)");
+            }
+        } catch (Throwable t) {
+            System.err.println("[mcphone_wiki] CefRenderer.initialize() failed: " + t);
         }
     }
 
