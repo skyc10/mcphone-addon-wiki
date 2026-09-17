@@ -1,0 +1,95 @@
+name: Release tagged build (附属最小 CI · X-01)
+
+# 约定（mcphone 生态 13-build-license-state §5 / 30-ROADMAP X-01/X-03/X-12）：
+#   1. tag → 干净工作区闸门 → clean build → 开/artifact 校验 → GitHub Release；
+#   2. 工作区不干净（-dirty）一律拒绝发版；
+#   3. tag 必须打在 HEAD（保证 git describe = tag 名，Tags.VERSION 正确）；
+#   4. 发布 jar 内必须随附许可证/第三方声明（X-03/X-12 发版检查项）。
+
+on:
+  push:
+    tags: [ '*' ]
+
+permissions:
+  contents: write
+
+jobs:
+  guard:
+    name: 发版闸门（干净工作区 + tag==HEAD）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Refuse dirty worktree（-dirty 拒绝发版）
+        run: |
+          DIRTY="$(git status --porcelain)"
+          if [ -n "$DIRTY" ]; then
+            echo "::error::工作区不干净 —— 拒绝发版（-dirty 产物无法对应 commit）"
+            printf '%s\n' "$DIRTY"
+            exit 1
+          fi
+
+      - name: tag 必须打在 HEAD
+        run: |
+          HEAD_SHA="$(git rev-parse HEAD)"
+          TAG_SHA="$(git rev-parse "${GITHUB_REF_NAME}^{commit}")"
+          if [ "$HEAD_SHA" != "$TAG_SHA" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} 不在 HEAD（产物版本来自 git describe，会得到带分支/hash 后缀的错版本名）"
+            exit 1
+          fi
+
+  release:
+    name: Clean build + artifact checks + GitHub Release
+    needs: guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Clean build（tag 之后 clean 重建）
+        run: ./gradlew clean build --no-daemon
+
+      - name: Artifact checks（无 -dirty / 版本含 tag / jar 随附许可声明）
+        run: |
+          set -e
+          TAG="${GITHUB_REF_NAME}"
+          echo "== build/libs =="
+          ls -l build/libs/
+          # 1) 不允许 -dirty 产物
+          if compgen -G 'build/libs/*-dirty*'; then
+            echo "::error::发现 -dirty 产物 —— 拒绝发版"
+            exit 1
+          fi
+          # 2) 发布 jar（非 -dev/-api/-sources）名必须含 tag
+          REL_JAR="$(ls build/libs/ | grep -E '\.jar$' | grep -Ev -- '-dev|-api|-sources' | head -1)"
+          if [ -z "$REL_JAR" ]; then
+            echo "::error::未找到发布 jar"
+            exit 1
+          fi
+          case "$REL_JAR" in
+            *"$TAG"*) : ;;
+            *) echo "::error::发布 jar 名（$REL_JAR）不含 tag $TAG —— 检查 tag/HEAD"; exit 1 ;;
+          esac
+          # 3) jar 内必须随附许可声明（X-03/X-12）
+          if ! jar tf "build/libs/$REL_JAR" | grep -iqE '(^|/)(LICENSE|LICENSE\.txt|THIRD-PARTY[^/]*|NOTICE)'; then
+            echo "::error::发布 jar（$REL_JAR）内无 LICENSE / THIRD-PARTY / NOTICE —— "
+            echo "       仓根 LICENSE 缺失或未进 resources；补齐前不得发版"
+            exit 1
+          fi
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            build/libs/*.jar
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,6 +1,11 @@
 package com.november.mcphone.addon.wiki.client;
 
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+
+import org.lwjgl.opengl.GL11;
+
+import net.minecraft.client.renderer.Tessellator;
 
 import cpw.mods.fml.relauncher.Side;
 import cpw.mods.fml.relauncher.SideOnly;
@@ -8,8 +13,9 @@ import cpw.mods.fml.relauncher.SideOnly;
 /**
  * net.montoyo.mcef.api.IBrowser 的反射包装（避免编译期依赖 MCEF）。
  *
- * <p>注入方法参数与 MCEF 0.7 的 {@code CefBrowserOsr} 实现对齐
- * （内部构造 java.awt.event 事件）：</p>
+ * <p>按 modern 内核主线编写：wiki 只针对实例里 browser jar 内嵌的 modern MCEF
+ * 内核（CefBrowserOsr 帧队列 + mcefUpdate() 上传），不做 legacy MCEF 0.6/0.7
+ * 兼容分支；注入方法签名以 modern {@code CefBrowserOsr} 为准：</p>
  * <ul>
  * <li>{@code injectMouseMove(x, y, modifiers, focus)}：focus=false → MOUSE_MOVED，
  *     true → MOUSE_EXITED（id 505）；</li>
@@ -20,32 +26,59 @@ import cpw.mods.fml.relauncher.SideOnly;
  * <li>{@code injectMouseWheel(x, y, modifiers, scrollAmount, wheelRotation)}：
  *     rotation 正值=向下滚。</li>
  * </ul>
+ *
+ * <p><b>S5-5 签名容错（probe）</b>：核心方法（resize/close/draw/getTextureID/
+ * loadURL/goBack/goForward/getURL）是 IBrowser 接口方法，查找失败直接抛错；
+ * 注入类方法用 {@link #probe} 容错探测——某个签名对不上只禁用对应功能
+ * （对应注入降级为 no-op + 一条日志），绝不拖垮整个 WikiHandle 构造、让
+ * createBrowser 整体报错（browser 侧实测根因同款）。</p>
+ *
+ * <p>S0-2 帧泵自驱动：GTNH 环境下 MCEF 的 onTick 帧上传未被驱动，onPaint 缓存
+ * 的帧永远停在 {@code queue} 里；{@link #pumpFrameUpload()} 在 drawScreen 每帧
+ * 自驱动 {@code CefApp.N_DoMessageLoopWork()} + {@code mcefUpdate()}（两者与
+ * MCEF 自带泵并存幂等无害）。</p>
+ *
+ * <p>S0-3 自绘四边形：绕开 CefRenderer.render()（Angelica GLSM 下 UV 缺陷 +
+ * ALPHA_TEST 丢 alpha=0 帧 → 整页透明），用正确 UV(0,0)-(1,1) 自绘；系统属性
+ * {@code -Dmcphone_wiki.legacyRenderer=true} 可退回原路径对比。</p>
  */
 @SideOnly(Side.CLIENT)
 public final class WikiHandle {
+
+    // ---- 绘制路径开关（S0-3，可退回 CefRenderer.render() 对比） ----
+    /** true = 走 MCEF 原生 render()（旧行为，对比用）；默认自绘四边形。 */
+    public static volatile boolean legacyRender =
+        Boolean.getBoolean("mcphone_wiki.legacyRenderer");
 
     private final Object browser;
     private final Method resize, close, draw, getTextureID, loadURL, goBack, goForward, getURL;
     private final Method injectMouseMove, injectMouseButton, injectMouseWheel;
     private final Method injectKeyPressed, injectKeyTyped, injectKeyReleased;
 
-    // 首帧探测：CefRenderer.view_width_/view_height_（实例版 MCEF 0.6 无 getter，
-    // 只能反射私有字段；render() 在二者为 0 时直接返回，>0 即已有真实帧上传纹理）。
-    // 同一 renderer_ 实例兼作纹理初始化兜底目标（见 rendererInit 注释），探测共享。
+    // ---- 帧泵（S0-2）：探测可缺省，缺哪个只降级对应功能 ----
+    private final Method mcefUpdate;   // CefBrowserOsr.mcefUpdate()（上传排队帧）
+    private final Field queueField;    // CefBrowserOsr.queue（诊断：帧是否到达）
+
+    // 首帧探测：CefRenderer.view_width_/view_height_（渲染分辨率实际值，
+    // 与期望值比对——S0-4 视口竞态；render() 在二者为 0 时直接返回，>0 即
+    // 至少上传过一帧）。同一 renderer_ 实例兼作纹理初始化兜底目标，探测共享。
     private final Object renderer;
     private final java.lang.reflect.Field fViewW, fViewH;
 
-    // ---- MCEF 上游纹理初始化兜底 ----
-    // CefRenderer.initialize()（glGenTextures 的唯一赋值点）在 MCEF 0.6/0.7 jar
-    // 中被孤儿化、无任何调用者，导致纹理 id 恒 0、画面永远停在 loading。
-    // 这里只探测方法是否存在并缓存，真正调用延迟到渲染线程（有 GL context 时）
-    // 由 ensureRendererInitialized() 执行；rendererInitialized 含失败也只跑一次。
+    // ---- 纹理初始化兜底 ----
     private final Method rendererInit;
     private boolean rendererInitialized;
+
+    // ---- 帧泵静态缓存（drawScreen 每帧调用，不能反复查表） ----
+    private static Method messageLoop;          // CefApp.N_DoMessageLoopWork()（静态）
+    private static boolean messageLoopProbed;
+
+    private boolean firstFrameLogged;
 
     WikiHandle(Object browser) throws Exception {
         this.browser = browser;
         Class<?> c = browser.getClass();
+        // 核心方法：接口必有，缺失即整体失败（构造抛错→createBrowser 才报错）
         resize = c.getMethod("resize", int.class, int.class);
         close = c.getMethod("close");
         draw = c.getMethod("draw", double.class, double.class, double.class, double.class);
@@ -54,12 +87,15 @@ public final class WikiHandle {
         goBack = c.getMethod("goBack");
         goForward = c.getMethod("goForward");
         getURL = c.getMethod("getURL");
-        injectMouseMove = c.getMethod("injectMouseMove", int.class, int.class, int.class, boolean.class);
-        injectMouseButton = c.getMethod("injectMouseButton", int.class, int.class, int.class, int.class, boolean.class, int.class);
-        injectMouseWheel = c.getMethod("injectMouseWheel", int.class, int.class, int.class, int.class, int.class);
-        injectKeyPressed = c.getMethod("injectKeyPressed", char.class, int.class);
-        injectKeyTyped = c.getMethod("injectKeyTyped", char.class, int.class);
-        injectKeyReleased = c.getMethod("injectKeyReleased", char.class, int.class);
+        // 注入方法：probe 容错（S5-5），缺失只禁用对应功能
+        injectMouseMove = probe(c, "injectMouseMove", int.class, int.class, int.class, boolean.class);
+        injectMouseButton = probe(c, "injectMouseButton",
+            int.class, int.class, int.class, int.class, boolean.class, int.class);
+        injectMouseWheel = probe(c, "injectMouseWheel",
+            int.class, int.class, int.class, int.class, int.class);
+        injectKeyPressed = probe(c, "injectKeyPressed", char.class, int.class);
+        injectKeyTyped = probe(c, "injectKeyTyped", char.class, int.class);
+        injectKeyReleased = probe(c, "injectKeyReleased", char.class, int.class);
 
         Object r = null;
         java.lang.reflect.Field fw = null, fh = null;
@@ -80,16 +116,14 @@ public final class WikiHandle {
         this.fViewW = fw;
         this.fViewH = fh;
 
-        // 探测 MCEF 0.6/0.7 上游 bug：CefRenderer.initialize()（glGenTextures 的
-        // 唯一赋值点）在上游被孤儿化、无任何调用者，导致纹理 id 恒 0。复用上面
-        // renderer_ 的探测结果（不重复反射取字段），只查找 initialize() 并缓存。
+        // 探测 CefRenderer.initialize()（纹理 id 唯一赋值点）并缓存。
         Method init = null;
         if (r != null) {
             try {
                 init = r.getClass().getDeclaredMethod("initialize");
                 init.setAccessible(true);
             } catch (Throwable t) {
-                // 其他 MCEF 版本可能已自行修复，打一行日志后不再尝试；
+                // 内核可能已自行修复，打一行日志后不再尝试；
                 // 首帧探测结果（renderer/fViewW/fViewH）保持不动。
                 System.out.println("[mcphone_wiki] renderer init shim not applicable: " + t);
                 init = null;
@@ -98,6 +132,40 @@ public final class WikiHandle {
         this.rendererInit = init;
         if (init != null) {
             System.out.println("[mcphone_wiki] OSR renderer texture-init shim armed");
+        }
+
+        // 帧泵探测（S0-2）：mcefUpdate()（帧上传入口）+ queue（帧队列，诊断用）。
+        Method upd = null;
+        try {
+            upd = c.getMethod("mcefUpdate");
+        } catch (Throwable t) {
+            System.out.println("[mcphone_wiki] mcefUpdate not found (frame pump disabled): " + t);
+        }
+        mcefUpdate = upd;
+        Field q = null;
+        try {
+            q = c.getDeclaredField("queue");
+            q.setAccessible(true);
+        } catch (Throwable t) {
+            System.out.println("[mcphone_wiki] paint queue probe failed (diagnostics disabled): " + t);
+        }
+        queueField = q;
+        System.out.println("[mcphone_wiki] frame pump armed (mcefUpdate=" + (upd != null)
+            + ", queue=" + (q != null) + ", viewFields=" + (fw != null) + ")"
+            + (legacyRender ? " [legacyRender=true, draw path = CefRenderer.render()]" : ""));
+    }
+
+    /**
+     * 容错方法探测（S5-5）：找到返回 Method，找不到打日志返回 null（对应注入
+     * 功能降级禁用），绝不让注入类方法的不匹配拖垮 WikiHandle 构造。
+     */
+    private static Method probe(Class<?> c, String name, Class<?>... paramTypes) {
+        try {
+            return c.getMethod(name, paramTypes);
+        } catch (Throwable t) {
+            System.err.println("[mcphone_wiki] WARN: " + c.getName() + "." + name
+                + " signature not found (feature disabled): " + t);
+            return null;
         }
     }
 
@@ -117,7 +185,7 @@ public final class WikiHandle {
         }
     }
 
-    /** CefRenderer 渲染页面四边形（绑定纹理、处理翻转）。 */
+    /** CefRenderer 渲染页面四边形（绑定纹理、处理翻转）——legacy 对比路径。 */
     public void draw(double x1, double y1, double x2, double y2) {
         try {
             draw.invoke(browser, x1, y1, x2, y2);
@@ -127,13 +195,56 @@ public final class WikiHandle {
     }
 
     /**
+     * 自绘页面四边形——「透明页面」的绘制侧修复（S0-3），绕开
+     * CefRenderer.render()：其 UV 取值有缺陷（v1=(1,1) 而非 (1,0)、v4 重复
+     * v1 的 UV），在 Angelica GLSM 的 FFP shader 变体下行为不确定；且 CEF OSR
+     * 默认背景色 alpha 可能为 0，vanilla 常驻 GL_ALPHA_TEST 会把 alpha&lt;0.1 的
+     * 片段整体丢弃 → 页面全透明。
+     *
+     * <p>自绘要点：绑定 CEF 纹理后显式 {@code glDisable(GL_ALPHA_TEST)}、
+     * {@code glDisable(GL_BLEND)}（纹理 alpha 不参与混合）、
+     * {@code glEnable(GL_TEXTURE_2D)}、恢复 {@code glColor4f(1,1,1,1)}，用正确
+     * 朝向的 UV(0,0)-(1,1) 画四边形。</p>
+     */
+    public void drawSelf(double x1, double y1, double x2, double y2) {
+        int tex = textureId();
+        if (tex == 0) {
+            return;
+        }
+        try {
+            GL11.glBindTexture(GL11.GL_TEXTURE_2D, tex);
+            GL11.glPushAttrib(GL11.GL_ALL_ATTRIB_BITS);
+            GL11.glDisable(GL11.GL_LIGHTING);
+            GL11.glEnable(GL11.GL_TEXTURE_2D);
+            GL11.glDisable(GL11.GL_BLEND);      // CEF 帧 alpha 不参与混合
+            GL11.glDisable(GL11.GL_ALPHA_TEST); // 防 alpha=0 帧被整体丢弃
+            GL11.glColor4f(1f, 1f, 1f, 1f);
+
+            Tessellator t = Tessellator.instance;
+            t.startDrawingQuads();
+            t.setColorOpaque_F(1f, 1f, 1f);
+            // 正确朝向的 UV：CEF onPaint 帧顶行在 buffer 开头 → 纹理 t=0 为页面顶部。
+            // 1.7.10 GUI y 向下，故 v = y 对应 (y1→0, y2→1)。
+            t.addVertexWithUV(x1, y1, 0, 0d, 0d);
+            t.addVertexWithUV(x1, y2, 0, 0d, 1d);
+            t.addVertexWithUV(x2, y2, 0, 1d, 1d);
+            t.addVertexWithUV(x2, y1, 0, 1d, 0d);
+            t.draw();
+
+            GL11.glPopAttrib();
+            GL11.glColor4f(1f, 1f, 1f, 1f);
+        } catch (Throwable tr) {
+            System.err.println("[mcphone_wiki] drawSelf failed: " + tr);
+        }
+    }
+
+    /**
      * 当前页面纹理 ID；未绘制首帧时为 0。
      *
-     * <p>MCEF 上游 bug 兜底：CefRenderer.initialize()（纹理 id 的唯一赋值点
-     * glGenTextures）在 MCEF jar 中无任何调用者，getTextureID() 恒 0。首次在
-     * 此读到 0 且兜底尚未执行时调用一次 initialize()。本方法只在
-     * WikiScreen.drawScreen（Client thread 渲染路径，有 GL context）中被调用，
-     * 因此在这里执行 glGenTextures 是线程安全的。</p>
+     * <p>上游 bug 兜底：CefRenderer.initialize()（纹理 id 的唯一赋值点
+     * glGenTextures）若无任何调用者，getTextureID() 恒 0。首次在此读到 0 且
+     * 兜底尚未执行时调用一次 initialize()。调用方在 WikiScreen.drawScreen
+     * （Client thread 渲染路径，有 GL context）调用，线程安全。</p>
      */
     public int textureId() {
         try {
@@ -150,12 +261,8 @@ public final class WikiHandle {
     }
 
     /**
-     * MCEF 上游纹理初始化兜底（反射调用 CefRenderer.initialize() 一次）。
-     *
-     * <p>调用时机约束：必须在持有 GL context 的线程上执行（glGenTextures 依赖
-     * 当前 context）。WikiScreen.drawScreen 在 Client thread 渲染路径上调用
-     * 本方法与 {@link #textureId()}，满足约束。无论成败只执行一次：失败后不再
-     * 重试，避免每帧反射调用刷屏。</p>
+     * 纹理初始化兜底（反射调用 CefRenderer.initialize() 一次）。
+     * 必须在持有 GL context 的线程上执行；无论成败只执行一次。
      */
     void ensureRendererInitialized() {
         if (rendererInitialized || rendererInit == null) {
@@ -178,7 +285,7 @@ public final class WikiHandle {
     }
 
     /**
-     * CEF 是否已向 GL 纹理上传过真实帧（view_width_/view_height_ > 0）。
+     * CEF 是否已向纹理上传过真实帧（view_width_/view_height_ &gt; 0）。
      * 反射不可用时返回 true（调用方走超时兜底）。
      */
     public boolean hasPaintedFrame() {
@@ -189,6 +296,104 @@ public final class WikiHandle {
             return fViewW.getInt(renderer) > 0 && fViewH.getInt(renderer) > 0;
         } catch (Throwable t) {
             return true;
+        }
+    }
+
+    // ===================== 帧泵（S0-2） =====================
+
+    /**
+     * 帧上传泵——「页面白/透明」的修复核心（S0-2）。
+     *
+     * <p>modern CefBrowserOsr 的 onPaint 只把帧缓存进 queue；真正上传到 GL 纹理
+     * 的是 {@code mcefUpdate()}，其唯一调用方是 MCEF ClientProxy 的 tick 回调。
+     * GTNH 环境下该回调未被驱动 → 帧永远停在队列里、视口字段恒 0。</p>
+     *
+     * <p>在 WikiScreen.drawScreen（GL 线程）每帧自驱动：
+     * ① {@code CefApp.N_DoMessageLoopWork()} 泵 CEF 消息循环（把 onPaint 送达）；
+     * ② {@code mcefUpdate()} 把队列里的帧上传到纹理。两者与 MCEF 自带的泵并存
+     * 幂等无害（mcefUpdate synchronized、队列空即空转）。</p>
+     */
+    public void pumpFrameUpload() {
+        if (mcefUpdate == null) {
+            return;
+        }
+        try {
+            Object app = McefBridge.cefAppHandle();
+            if (app != null) {
+                Method ml = messageLoopMethod(app);
+                if (ml != null) {
+                    ml.invoke(app);
+                }
+            }
+        } catch (Throwable t) {
+            // 消息循环泵失败只降级：CEF 内部线程仍可能继续送帧，不刷屏
+        }
+        try {
+            mcefUpdate.invoke(browser);
+            if (!firstFrameLogged && fViewW != null && renderer != null) {
+                int w = fViewW.getInt(renderer);
+                int h = fViewH.getInt(renderer);
+                if (w > 0 && h > 0) {
+                    firstFrameLogged = true;
+                    System.out.println("[mcphone_wiki] first frame uploaded (" + w + "x" + h + ")");
+                }
+            }
+        } catch (Throwable t) {
+            System.err.println("[mcphone_wiki] mcefUpdate failed: " + t);
+        }
+    }
+
+    private static Method messageLoopMethod(Object app) {
+        if (!messageLoopProbed) {
+            messageLoopProbed = true;
+            try {
+                messageLoop = app.getClass().getMethod("N_DoMessageLoopWork");
+            } catch (Throwable t) {
+                System.err.println("[mcphone_wiki] WARN: CefApp.N_DoMessageLoopWork not found"
+                    + " (message-loop pump disabled): " + t);
+            }
+        }
+        return messageLoop;
+    }
+
+    // ===================== 诊断 =====================
+
+    /**
+     * 等待上传的帧数（queue 深度）。&gt;0 = CEF 在产帧、只是没被上传；
+     * 0 = CEF 没有产出新帧；-1 = 探测失败（无诊断能力）。
+     */
+    public int queuedFrames() {
+        if (queueField == null) {
+            return -1;
+        }
+        try {
+            return ((java.util.LinkedList<?>) queueField.get(browser)).size();
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    /** 渲染视口宽（反射 CefRenderer.view_width_）。-1 = 探测失败。 */
+    public int cefViewWidth() {
+        if (fViewW == null || renderer == null) {
+            return -1;
+        }
+        try {
+            return fViewW.getInt(renderer);
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    /** 渲染视口高（镜像 {@link #cefViewWidth()}），-1 = 探测失败。 */
+    public int cefViewHeight() {
+        if (fViewH == null || renderer == null) {
+            return -1;
+        }
+        try {
+            return fViewH.getInt(renderer);
+        } catch (Throwable t) {
+            return -1;
         }
     }
 
@@ -221,8 +426,11 @@ public final class WikiHandle {
         }
     }
 
+    // ===================== 输入注入（probe 可降级：缺失时 no-op） =====================
+
     /** focus=false → MOUSE_MOVED；true → MOUSE_EXITED。 */
     public void injectMouseMove(int x, int y, int modifiers, boolean focus) {
+        if (injectMouseMove == null) return;
         try {
             injectMouseMove.invoke(browser, x, y, modifiers, focus);
         } catch (Throwable t) {}
@@ -230,6 +438,7 @@ public final class WikiHandle {
 
     /** button 为 AWT 编号：1=左 2=中 3=右。 */
     public void injectMouseButton(int x, int y, int modifiers, int button, boolean pressed, int clickCount) {
+        if (injectMouseButton == null) return;
         try {
             injectMouseButton.invoke(browser, x, y, modifiers, button, pressed, clickCount);
         } catch (Throwable t) {}
@@ -237,25 +446,29 @@ public final class WikiHandle {
 
     /** rotation 正值=向下滚。 */
     public void injectMouseWheel(int x, int y, int modifiers, int scrollAmount, int rotation) {
+        if (injectMouseWheel == null) return;
         try {
             injectMouseWheel.invoke(browser, x, y, modifiers, scrollAmount, rotation);
         } catch (Throwable t) {}
     }
 
-    /** modifiers 恒传 0（keyCode 在 MCEF 0.7 中无法表达）。 */
+    /** modifiers 恒传 0（keyCode 在 char 通道中无法表达）。 */
     public void injectKeyPressed(char c, int modifiers) {
+        if (injectKeyPressed == null) return;
         try {
             injectKeyPressed.invoke(browser, c, modifiers);
         } catch (Throwable t) {}
     }
 
     public void injectKeyTyped(char c, int modifiers) {
+        if (injectKeyTyped == null) return;
         try {
             injectKeyTyped.invoke(browser, c, modifiers);
         } catch (Throwable t) {}
     }
 
     public void injectKeyReleased(char c, int modifiers) {
+        if (injectKeyReleased == null) return;
         try {
             injectKeyReleased.invoke(browser, c, modifiers);
         } catch (Throwable t) {}

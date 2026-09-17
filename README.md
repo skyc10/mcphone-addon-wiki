@@ -37,12 +37,14 @@ MCphone 附属 mod：**GTNH 中文维基 App**（id=`wiki`）。在 MCphone 手�
 > （`MCEF-1.7.10-patched.jar`，详见该项目的 MCEF-PATCH-NOTES.md）。
 > MCEF 缺失或处于虚拟模式时，App 显示前置缺失提示页，绝不崩溃。
 
-**浏览器引导机制**：打开维基屏时先用 MCEF 内置本地页 `mod://mcef/home.html`
-创建 OSR 浏览器并完成首帧渲染，然后才导航到维基页面。在 CEF 3.2171 上直接用
-外链 URL 创建浏览器会因视口初始化竞态导致首帧永不上传（界面纯白）；
-「本地页引导 → 首帧后 loadURL」是 F10 示例浏览器实测可靠的同款路径。
-首帧探测反射 `CefRenderer.view_width_/view_height_`（>0 即有真实帧上传），
-探测不可用时按帧数超时兜底，引导页不会进入书签/历史/上次页面记录。
+**浏览器引导机制（S5 后）**：打开维基屏时**直接以目标 URL 创建 OSR 浏览器**，
+不再挂本地引导页；首帧/视口竞态由首帧后探测
+`CefRenderer.view_width_/view_height_` 并重断言 `resize` 兜底（S0-4）。
+若目标页面约 4~6 秒（120 帧）仍未出首帧，降级一次 `data:text/html` 空白引导页、
+出帧后再导航到目标页（仅一次，防无限重试）。引导页/空白页一律不写入
+书签/历史/上次页面记录。内核探测为三态（S5-2）：确认可用 / 初始化中（pending，
+每次打开维基都重试）/ 确认缺失（缺 MCEF modern 或 mcphone-addon-browser 等
+前置时给出可行动指引文案）。
 
 安装：把 `mcphone-addon-wiki-1.0.0.jar` 放进实例 `mods/`（与 mcphone、qz_uilib、MCEF 同目录）。
 
@@ -98,3 +100,23 @@ src/main/java/com/november/mcphone/addon/wiki/
 - 不改 MCphone / Qz-UILib / MCEF 源码，对 MCEF 全程反射；
 - 手机 NBT 只写 `mcphone:wiki:` 前缀键；
 - 附属任何初始化失败只打日志，不拖垮手机本体与游戏。
+
+## 发版检查清单（X-01 最小 CI + X-03 许可证治理）
+
+> 落地：`.github/workflows/release.yml`（tag → 干净工作区闸门 → clean build → 制品校验 →
+> GitHub Release）。CI 文件统一由"契约/CI"任务（t9/X-01）撰写 —— 本仓 AW-09 的 CI 部分由
+> 同一模板覆盖，**勿在 AW-09 里重复写一版**（避免双 workflow 冲突）；AW-09 的实际动作
+> 收敛为：补 LICENSE 本体 + README 许可节 + 确认 CI 校验通过。
+
+1. **流程**：用户确认后 → 打 tag（必须打在干净工作区的 HEAD 上）→ 推分支 + tag →
+   CI 自动构建并发 Release → 事后 `gh release edit --notes-file <file.md>` 补中文说明
+   （中文内联参数会被编码破坏，必须走 `--notes-file`）。
+2. **`-dirty` 拒绝发版**：本机构建前 `git status --porcelain` 必须为空；CI 闸门在工作区不干净
+   或 tag 不在 HEAD 时直接 fail（`-dirty` 产物无法对应 commit）。
+3. **jar 必须在 tag 之后 clean 重建**（`Tags.VERSION` 才正确；CI 已强制 `clean build`）。
+4. **许可声明随 jar（X-03/X-12 检查项）**：本仓 LICENSE 正在补齐（AW-09，建议 MIT，见
+   `13-build-license-state.md` §4.1 的真实缺口记录）。**在 LICENSE 落仓之前，tag 发版会被
+   CI 的"jar 内无许可声明"校验拒绝——这是治理设计，不是故障**：无许可证 = 默认保留所有
+   权利，不得对外发版。CI 校验发布 jar 内必须含 `LICENSE` / `THIRD-PARTY` / `NOTICE` 条目。
+5. 版本号三分辨：产物名 = `git describe`；`gradle.properties` 的 `version` 是兜底死值；
+   `-dev` / `-api` / `-sources` 后缀 jar 不是发布制品。

@@ -23,11 +23,15 @@ import cpw.mods.fml.relauncher.SideOnly;
  * （走 shutdown hooks），任何阻塞的钩子都会让退出永不完成——因此强制结束时
  * 用<b>反射</b>调用真正的 halt，反射分发不经过本类字节码，FML 改不到它。</p>
  *
- * <p>时序：running=false → 异步关掉我们打开的浏览器（close 的 native 调用会
- * 阻塞，同步执行会把看门狗自己卡死）→ 宽限 5 秒 → 扫描循环：</p>
+ * <p><b>S0-7 门控</b>：wiki-local 静态 volatile {@link #browserCreated}，
+ * {@link McefBridge#create} 成功时置位。本会话从未创建过浏览器时直接收工，
+ * 不再走 5 s 宽限 + 90 s kill 时间线（中期由宿主 C9 的
+ * registerShutdownCleanup 归口后取代本类）。</p>
+ *
+ * <p>时序（有浏览器时）：running=false → 异步关掉我们打开的浏览器（close 的
+ * native 调用会阻塞，同步执行会把看门狗自己卡死）→ 宽限 5 秒 → 扫描循环：</p>
  * <ul>
- * <li>主线程消亡且无 CEF 残留线程 → 交由 JVM 自然退出（未装 MCEF 或从未打开过
- *     维基时 hungCefThreads() 恒为空，走的就是这条自然退出分支）；</li>
+ * <li>主线程消亡且无 CEF 残留线程 → 交由 JVM 自然退出；</li>
  * <li>主线程消亡但有存活的 CEF/MCEF 非守护线程 → 反射 halt；</li>
  * <li><b>无条件 kill timer：running=false 后 90 秒</b>，无论主线程死活、无论
  *     上面判定如何，dump 全部非守护线程堆栈（留诊断证据）后强制 halt。
@@ -47,6 +51,12 @@ public final class ExitWatchdog {
     private static final long SCAN_LOG_INTERVAL_MS = 10000;
     private static final String MAIN_THREAD_NAME = "Client thread";
 
+    /**
+     * 本会话是否成功创建过维基浏览器（S0-7 门控信号源）。
+     * McefBridge.create 成功时置位；从未创建 → 看门狗直接收工。
+     */
+    public static volatile boolean browserCreated;
+
     private static File logFile;
     private static volatile boolean fileOnly;
 
@@ -61,7 +71,8 @@ public final class ExitWatchdog {
             logFile = null;
         }
         log("ExitWatchdog armed; file log: "
-            + (logFile != null ? logFile.getAbsolutePath() : "<unavailable>"));
+            + (logFile != null ? logFile.getAbsolutePath() : "<unavailable>")
+            + "; browserCreated=" + browserCreated);
         Thread t = new Thread(ExitWatchdog::watch, "mcphone_wiki-ExitWatchdog");
         t.setDaemon(true);
         t.start();
@@ -112,6 +123,14 @@ public final class ExitWatchdog {
         }
         fileOnly = true;
         log("running=false detected, game is exiting (switching to file-only logging)");
+
+        // S0-7 门控：从未创建过维基浏览器 → 本进程不可能有我们留下的 CEF 阻塞，
+        // 直接收工，不再走 5 s 宽限 + 90 s kill 时间线。
+        if (!browserCreated) {
+            log("no wiki browser was ever created this session — disarming directly"
+                + " (no grace period, no kill timer)");
+            return;
+        }
 
         // 异步关闭我们打开的浏览器（b.close() 的 native 调用在消息泵死后会
         // 永久阻塞，不能占用看门狗线程），随后给正常清理留宽限期

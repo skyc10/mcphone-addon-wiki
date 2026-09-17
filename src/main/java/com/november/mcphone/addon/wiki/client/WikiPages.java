@@ -13,6 +13,7 @@ import club.heiqi.uilib.ui.scene.control.SceneTextInput;
 import club.heiqi.uilib.ui.scene.input.SceneEventType;
 import club.heiqi.uilib.ui.scene.layout.CrossAxisAlign;
 import club.heiqi.uilib.ui.scene.node.SceneNode;
+import club.heiqi.uilib.ui.scene.runtime.SceneScrolls;
 import club.heiqi.uilib.ui.reactive.Signal;
 
 import com.november.mcphone.addon.wiki.WikiAddon;
@@ -42,7 +43,7 @@ final class WikiPages {
     private WikiPages() {}
 
     static SceneNode create(PhoneUi ui) {
-        SceneNode page = scrollColumn();
+        SceneNode page = scrollColumn(ui);
         page.appendChild(PhoneUi.title(tr("app.mcphone_wiki.wiki")));
 
         McefBridge.detect();
@@ -154,7 +155,12 @@ final class WikiPages {
         return StatCollector.translateToLocal(key);
     }
 
-    private static SceneNode scrollColumn() {
+    /**
+     * 自建滚动列（S0-5）：Qz 要求先 {@code setScrollable(true)}，再补漏掉的
+     * {@link SceneScrolls#attach}——不 attach 则滚轮事件不会作用到本列
+     * （书签+历史 20+ 条时管理页滚不动）。
+     */
+    private static SceneNode scrollColumn(PhoneUi ui) {
         SceneNode col = SceneNode.column();
         col.setFillParentWidth(true);
         col.setFlexGrow(1);
@@ -162,6 +168,7 @@ final class WikiPages {
         col.setGap(10);
         col.setScrollable(true);
         col.setClipChildren(true);
+        SceneScrolls.attach(ui.runtime(), col);
         return col;
     }
 
