@@ -3,6 +3,9 @@ package com.november.mcphone.addon.wiki.client;
 import org.lwjgl.input.Keyboard;
 import org.lwjgl.input.Mouse;
 
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiScreen;
 import net.minecraft.util.StatCollector;
@@ -30,10 +33,12 @@ import com.november.mcphone.addon.wiki.core.WikiStore;
  * CEF 渲染分辨率 cefW/cefH 与 GUI 尺寸独立，注入坐标按 cefW/viewW、cefH/viewH
  * 缩放（S0-4 坐标错位修复）。</p>
  *
- * <p>注入约定（与 modern CefBrowserOsr 对齐）：
- * 鼠标按钮为 AWT 编号（1=左 2=中 3=右）；injectMouseMove 的 focus=false 才是
- * MOUSE_MOVED（true=EXITED）；键盘 Pressed → (chr≠0 时) Typed → Released，
- * modifiers 恒 0。1.7.10 只在按下时回调 keyTyped，Released 在
+ * <p>注入约定（与 modern CefBrowserOsr 对齐，T6 与 browser 侧口径统一）：
+ * 鼠标按钮为 AWT 编号（1=左 2=中 3=右），modifiers 为 AWT 修饰键+按钮掩码
+ * （native 层经 getModifiersEx 读）；键盘：字符/控制字符走 Pressed → Typed →
+ * Released，非字符键（方向键/Delete/Home/End/翻页/F1-F12）走 ByKeyCode 管道
+ * （remapKeycode → GLFW 码）且按下/释放配对；OSR 焦点在首帧上传后与每次页面
+ * 点击前重挂。1.7.10 只在按下时回调 keyTyped，Released 在
  * handleKeyboardInput 里补发。</p>
  */
 public class WikiScreen extends GuiScreen {
@@ -64,7 +69,19 @@ public class WikiScreen extends GuiScreen {
     private String createError;
     private long lastUrlSync;
     private boolean lastInPage;
+    private boolean wheelDiagDone; // 首次滚轮诊断日志只打一次
     private int pressedCefBtn = -1;
+    // T8/C6：活动 press 的原始注入坐标——initGui/onGuiClosed 兜底释放与
+    // 「未配对 press 补发」诊断日志使用；配对释放后仅作诊断残留，无行为影响。
+    private int pressedGuiX, pressedGuiY, pressedCefX, pressedCefY;
+    // T8/C6 防御计数：press 注入前发现上一击未配对时，已补发 release 的次数。
+    private int staleRescueCount;
+    /** 补发 rescue 日志只打一次（罕见事件，默认开——直接佐证 C6 是否真实发生）。 */
+    private boolean rescueDiagDone;
+    // T8 导航后首点一次性诊断：armed 于 create 与每次 drawScreen 观测到 URL 变化；
+    // 预算 2 行/实例（page1 基线 + 导航后首点各一），绝不刷屏。
+    private boolean navClickDiag;
+    private int navClickDiagBudget = 2;
     private String shownUrl = "";
 
     /** S5-1 降级：已尝试过 data: 引导 / CEF 当前停在 data: 引导页。 */
@@ -180,11 +197,19 @@ public class WikiScreen extends GuiScreen {
                 } else {
                     computeCefSize();
                     browser.resize(cefW, cefH);
+                    navClickDiag = true; // T8：初始加载也是一次导航（t3：wiki 首页即 data:→wiki_home 跳转后的新页）
                 }
             }
         } else {
             WikiHandle b = browser;
             if (b != null) {
+                // T8/C6 兜底：resize 触发的 initGui 重入时，清掉可能滞留的未配对
+                // press（先补发一次 release 再复位；守卫内才触发，正常路径无注入）。
+                if (pressedCefBtn != -1) {
+                    b.injectMouseButton(pressedCefX, pressedCefY,
+                        toAwtMask(pressedCefBtn) | awtModifiers(), pressedCefBtn, false, 1);
+                    pressedCefBtn = -1;
+                }
                 computeCefSize();
                 b.resize(cefW, cefH);
             }
@@ -232,6 +257,14 @@ public class WikiScreen extends GuiScreen {
         }
         WikiHandle b = browser;
         if (b != null) {
+            // T8/C6 兜底：GUI 关闭时若尚有未配对的 press（mouseMovedOrUp 因故未
+            // 到达），先补发一次 release 再关闭，防止按钮状态语义上悬着
+            // （其后的 close 会销毁内核侧状态，补发本身无害）。
+            if (pressedCefBtn != -1) {
+                b.injectMouseButton(pressedCefX, pressedCefY,
+                    toAwtMask(pressedCefBtn) | awtModifiers(), pressedCefBtn, false, 1);
+                pressedCefBtn = -1;
+            }
             browser = null;
             b.close();
         }
@@ -314,6 +347,7 @@ public class WikiScreen extends GuiScreen {
                 shownUrl = cur;
                 WikiStore.setLastUrl(cur);
                 WikiStore.addHistory(cur);
+                navClickDiag = true; // T8：观测到 URL 变化=一次导航，arm 下一次首点诊断
             }
         }
         String shown = shownUrl;
@@ -348,6 +382,12 @@ public class WikiScreen extends GuiScreen {
             }
         } else {
             drawErrorPage(bx, by, b);
+        }
+
+        // T6-3：反射探测降级提示——不再静默，页面上常显一行（仅降级时出现）
+        if (b != null && b.inputDegraded()) {
+            fontRendererObj.drawStringWithShadow(
+                "Input degraded: " + b.degradedNotice(), bx + 8, by + viewH - 12, 0xFFFF55);
         }
 
         // 页面边框
@@ -403,19 +443,71 @@ public class WikiScreen extends GuiScreen {
 
     // ===================== 键盘 =====================
 
+    /**
+     * 当前 AWT 修饰键掩码（从 LWJGL 键盘状态实时读取）。JCEF native 层经
+     * {@code KeyEvent.getModifiersEx} 读修饰键；恒传 0 会让 CEF 认为修饰键全松开
+     * ——Shift+字符、Ctrl+V 等在页面内全部失效（与 browser 侧口径一致，T6-2）。
+     * 无修饰键时返回 0。
+     */
+    private static int awtModifiers() {
+        int m = 0;
+        if (Keyboard.isKeyDown(42) || Keyboard.isKeyDown(54)) m |= 64;   // SHIFT_DOWN_MASK
+        if (Keyboard.isKeyDown(29) || Keyboard.isKeyDown(157)) m |= 128; // CTRL_DOWN_MASK
+        if (Keyboard.isKeyDown(56) || Keyboard.isKeyDown(184)) m |= 512; // ALT_DOWN_MASK
+        return m;
+    }
+
+    /**
+     * LWJGL 键码能否经 ByKeyCode 管道表达——白名单必须与嵌入版
+     * {@code CefBrowserOsr.remapKeycode} 认识的键一致（LWJGL → GLFW），
+     * 其余键发过去会变成 keyCode=0/keyChar=0 的垃圾事件，直接不发
+     * （T6-1：Enter/Delete/方向键/Home/End/翻页/F1-F12 全部走 keyCode 通道）。
+     */
+    private static boolean isExpressableNonCharKey(int keyCode) {
+        switch (keyCode) {
+            case 14:  // Backspace
+            case 15:  // Tab
+            case 28:  // Enter（小键盘）
+            case 199: // Home
+            case 200: // Up
+            case 201: // Page Up
+            case 203: // Left
+            case 205: // Right
+            case 207: // End
+            case 208: // Down
+            case 209: // Page Down
+            case 211: // Delete
+                return true;
+            default:
+                return isFunctionKey(keyCode); // F1-F12
+        }
+    }
+
+    /** F1–F10 = LWJGL 59..68、F11 = 87、F12 = 88（内核 remapKeycode 映射 GLFW 290-301）。 */
+    private static boolean isFunctionKey(int keyCode) {
+        return keyCode >= 59 && keyCode <= 68 || keyCode == 87 || keyCode == 88;
+    }
+
     @Override
     protected void keyTyped(char typedChar, int keyCode) {
         if (keyCode == 1) { // Esc
             closeScreen();
             return;
         }
-        // 页面模式：Pressed → (chr≠0 时) Typed；Released 由 handleKeyboardInput 补发。
-        // 键盘注入不涉及页面坐标，无需缩放。
+        // 页面模式：字符/控制字符（\b \r \t，内核 controlCharToGlfwKey 映射）走
+        // Pressed → Typed；非字符键（character=0）走 ByKeyCode 管道（嵌入版
+        // remapKeycode → GLFW 码 → natives），白名单外的键不发（T6-1）。
+        // Released 由 handleKeyboardInput 补发。键盘注入不涉及页面坐标，无需缩放。
         WikiHandle b = browser;
         if (b != null) {
-            b.injectKeyPressed(typedChar, 0);
-            if (typedChar != 0) {
-                b.injectKeyTyped(typedChar, 0);
+            int mods = awtModifiers();
+            if (typedChar == 0) {
+                if (isExpressableNonCharKey(keyCode)) {
+                    b.injectKeyPressedByKeyCode(keyCode, '\0', mods);
+                }
+            } else {
+                b.injectKeyPressed(typedChar, mods);
+                b.injectKeyTyped(typedChar, mods);
             }
         }
     }
@@ -424,10 +516,19 @@ public class WikiScreen extends GuiScreen {
     public void handleKeyboardInput() {
         super.handleKeyboardInput();
         // keyTyped 只在按下时回调；这里补发松开事件（修饰键/按键状态不残留）。
+        // 非字符键的释放走 ByKeyCode，与按下路径配对（T6-1）。
         if (!Keyboard.getEventKeyState() && !Keyboard.isRepeatEvent()) {
             WikiHandle b = browser;
             if (b != null) {
-                b.injectKeyReleased(Keyboard.getEventCharacter(), 0);
+                char c = Keyboard.getEventCharacter();
+                if (c == 0) {
+                    int k = Keyboard.getEventKey();
+                    if (isExpressableNonCharKey(k)) {
+                        b.injectKeyReleasedByKeyCode(k, '\0', awtModifiers());
+                    }
+                } else {
+                    b.injectKeyReleased(c, awtModifiers());
+                }
             }
         }
     }
@@ -442,6 +543,15 @@ public class WikiScreen extends GuiScreen {
     /** MC 按钮 → AWT 按钮（1=左 2=中 3=右）。 */
     private static int toAwtButton(int mcBtn) {
         return mcBtn == 0 ? 1 : mcBtn == 1 ? 3 : 2;
+    }
+
+    /**
+     * AWT 按钮 → {@code InputEvent.BUTTONx_DOWN_MASK}（左 1024 / 中 2048 / 右 4096）。
+     * JCEF 原生层经 {@code getModifiersEx} 读掩码判定按的是哪个按钮——恒传 0 会被
+     * 当成「无按钮按下」而整个点击被 Blink 忽略（T6-2：与 browser 侧同款修复）。
+     */
+    private static int toAwtMask(int awtBtn) {
+        return awtBtn == 1 ? 1024 : awtBtn == 3 ? 4096 : 2048;
     }
 
     @Override
@@ -471,20 +581,74 @@ public class WikiScreen extends GuiScreen {
         }
         WikiHandle b = browser;
         if (inPage(mx, my) && b != null) {
+            // OSR 焦点重挂：create 时 native browser 尚在异步创建，那时的一次性
+            // setFocus 很可能被丢弃——CEF 无焦点时点击/键盘事件被整体忽略
+            // （T6-4：与 browser 侧 BrowserScreen.mouseClicked 同款）。
+            b.setFocus(true);
+            int cx = cefX(mx);
+            int cy = cefY(my);
+            // T8/C6 防御（43 报告 §5 C6 行，与 browser 侧同款）：上一击的 release
+            // 若因故未配对（mouseMovedOrUp 未到达），pressedCefBtn 滞留 → Chromium
+            // 认该键仍按下 → 本次 mousedown 被当 drag/重复按吞掉。press 之前先补发
+            // 一次 release 兜底；守卫内才触发，正常路径零额外开销、无语义副作用。
+            int stale = pressedCefBtn;
+            if (stale != -1) {
+                b.injectMouseButton(pressedCefX, pressedCefY,
+                    toAwtMask(stale) | awtModifiers(), stale, false, 1);
+                staleRescueCount++;
+                pressedCefBtn = -1;
+                if (!rescueDiagDone) {
+                    rescueDiagDone = true;
+                    System.out.println("[mcphone_wiki] stale press rescued: leaked btn="
+                        + stale + " pressed_at gui=(" + pressedGuiX + "," + pressedGuiY
+                        + ") cef=(" + pressedCefX + "," + pressedCefY
+                        + ") release_resent_at cef=(" + cx + "," + cy
+                        + ") total_rescues=" + staleRescueCount);
+                }
+            }
             pressedCefBtn = toAwtButton(btn);
-            // S0-4：注入坐标按 cefW/viewW、cefH/viewH 缩放到 CEF 渲染分辨率
-            b.injectMouseButton(cefX(mx), cefY(my), 0, pressedCefBtn, true, 1);
+            pressedGuiX = mx;
+            pressedGuiY = my;
+            pressedCefX = cx;
+            pressedCefY = cy;
+            int mask = toAwtMask(pressedCefBtn);
+            // T8：导航后首点一次性诊断（默认开，预算 2 行/实例）——字段供
+            // 43 报告 §4 E1-E6 判读：press 是否注入、坐标/视口是否正确、
+            // 是否是「补发 release」救了这次点击
+            if (navClickDiag && navClickDiagBudget > 0) {
+                navClickDiag = false;
+                navClickDiagBudget--;
+                String cur = b.getURL();
+                System.out.println("[mcphone_wiki] first post-nav click: url="
+                    + ((cur != null && !cur.isEmpty()) ? cur : "n/a")
+                    + " gui=(" + mx + "," + my + ")"
+                    + " page=(" + (mx - boxX()) + "," + (my - boxY()) + ")"
+                    + " cef=(" + cx + "," + cy + ")"
+                    + " pressedBtn=" + pressedCefBtn
+                    + " stalePressedBtn=" + stale
+                    + " rescued=" + (stale != -1)
+                    + " clickCount=1"
+                    + " mods=" + (mask | awtModifiers())
+                    + " viewport=" + cefW + "x" + cefH
+                    + " actualViewport=" + b.cefViewWidth() + "x" + b.cefViewHeight()
+                    + " hasFocus=" + diagHasFocus(b));
+            }
+            // S0-4：注入坐标按 cefW/viewW、cefH/viewH 缩放到 CEF 渲染分辨率；
+            // modifiers = 按钮掩码 | 实时修饰键（T6-2）。
+            b.injectMouseButton(cx, cy, mask | awtModifiers(), pressedCefBtn, true, 1);
         }
     }
 
     @Override
     protected void mouseMovedOrUp(int mx, int my, int which) {
         if (which != -1) {
-            // 释放：无论是否仍在页面内都配对发送，避免 CEF 侧按键卡死
+            // 释放：无论是否仍在页面内都配对发送，避免 CEF 侧按键卡死。
+            // 掩码与按下时一致（JCEF native 按掩码识别按钮，release 传 0 同样失效）。
             if (pressedCefBtn != -1) {
                 WikiHandle b = browser;
                 if (b != null) {
-                    b.injectMouseButton(cefX(mx), cefY(my), 0, pressedCefBtn, false, 1);
+                    b.injectMouseButton(cefX(mx), cefY(my),
+                        toAwtMask(pressedCefBtn) | awtModifiers(), pressedCefBtn, false, 1);
                 }
                 pressedCefBtn = -1;
             }
@@ -503,16 +667,50 @@ public class WikiScreen extends GuiScreen {
         int ex = Mouse.getEventX() * this.width / this.mc.displayWidth;
         int ey = this.height - Mouse.getEventY() * this.height / this.mc.displayHeight - 1;
         boolean over = inPage(ex, ey);
-        // focus=false → MOUSE_MOVED；true → MOUSE_EXITED（离开页面时补发一次）
+        // focus=false → MOUSE_MOVED；true → MOUSE_EXITED（离开页面时补发一次）；
+        // modifiers 为实时修饰键掩码（T6-2 口径统一）。
         if (over || lastInPage) {
-            b.injectMouseMove(cefX(ex), cefY(ey), 0, !over);
+            b.injectMouseMove(cefX(ex), cefY(ey), awtModifiers(), !over);
         }
         lastInPage = over;
         int wheel = Mouse.getEventDWheel();
         if (wheel != 0 && over) {
-            // Java MouseWheelEvent：rotation 正值=向下；MC 正值=向上
-            int rotation = wheel > 0 ? -1 : 1;
-            b.injectMouseWheel(cefX(ex), cefY(ey), 0, 120, rotation);
+            // 符号口径（t2 取证，roadmap-2026-09/42 §1 推导链，勿改回；T1 旧注释
+            // 「不在注入层/内核另案处理」已被 t2 否定，勿复用）：
+            // LWJGL2 Mouse.getEventDWheel() 正=滚轮向上；cefclient OSR 官方样例
+            // 原样直通不改号，native 层读 getUnitsToScroll()=amount×delta 直灌
+            // Blink ⇒ CEF/Blink deltaY 正=向上。故 rotation 与 getEventDWheel()
+            // 同号（正值=向上滚）。初版 `wheel > 0 ? -1 : 1` 系被 java.awt
+            // MouseWheelEvent「rotation 正值=向下」误导，是全仓滚轮反向的唯一翻转层。
+            int rotation = wheel > 0 ? 1 : -1;
+            // 一次性滚轮诊断（默认关，-Dmcphone_wiki.diag 开启；wiki 与 browser
+            // 反射隔离，用独立开关，不复用 mcphone_browser.diag）
+            if (!wheelDiagDone && Boolean.getBoolean("mcphone_wiki.diag")) {
+                wheelDiagDone = true;
+                System.out.println("[mcphone_wiki] first wheel: cef=(" + cefX(ex)
+                    + "," + cefY(ey) + ") rotation=" + rotation
+                    + " actualViewport=" + b.cefViewWidth() + "x" + b.cefViewHeight());
+            }
+            b.injectMouseWheel(cefX(ex), cefY(ey), awtModifiers(), 120, rotation);
+        }
+    }
+
+    /**
+     * T8 诊断：反射穿透 {@link WikiHandle} 的内核包装，探测内核是否有
+     * {@code hasFocus()} 入口并读取。任一环节不成立返回 {@code "n/a"}——只读
+     * 探测，无任何副作用（WikiHandle.java 非 t16 inScope，故不改它，只在
+     * WikiScreen 侧做一次性日志时刻的反射探测）。
+     */
+    private static String diagHasFocus(WikiHandle b) {
+        try {
+            Field f = WikiHandle.class.getDeclaredField("browser");
+            f.setAccessible(true);
+            Object osr = f.get(b);
+            if (osr == null) return "n/a";
+            Method m = osr.getClass().getMethod("hasFocus");
+            return String.valueOf(m.invoke(osr));
+        } catch (Throwable t) {
+            return "n/a";
         }
     }
 

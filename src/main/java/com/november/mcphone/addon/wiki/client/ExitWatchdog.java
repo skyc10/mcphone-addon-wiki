@@ -42,6 +42,15 @@ import cpw.mods.fml.relauncher.SideOnly;
  * <p>日志策略：arm() 起双写 System.out + 实例 logs/mcphone_wiki_watchdog.log；
  * 检测到 running=false 后<b>只写文件</b>——退出阶段 log4j 已停、控制台管道状态
  * 不可控，println 可能阻塞或丢字，文件才是唯一可信通道。</p>
+ *
+ * <p><b>t15 修复（T4-F3+F4，2026-09-18）</b>：①forceHalt 末档直调
+ * {@link Runtime#halt(int)} 已删除（FML "REROUTING TO FML" 实锤该末档被改写为
+ * System.exit，钩子卡死时反而制造进程残留）；反射失败后仅保留
+ * FMLCommonHandler.exitJava(0, false)，再失败则落日志、交给本体 ForceExitWatchdog
+ * 的外部杀手兜底。②S0-7 门控升级为双条件：{@code browserCreated == false} 且
+ * JVM 里确实没有任何 CEF/MCEF 非守护线程时才直接收工——wiki 单装（无 browser
+ * 附属）而 CEF 由其它路径拉起时，MCEF-Shutdown 线程仍可能挂死主 JVM，保护线
+ * 不再缺席（与 browser 侧 hungCefThreads 同口径）。</p>
  */
 @SideOnly(Side.CLIENT)
 public final class ExitWatchdog {
@@ -124,11 +133,14 @@ public final class ExitWatchdog {
         fileOnly = true;
         log("running=false detected, game is exiting (switching to file-only logging)");
 
-        // S0-7 门控：从未创建过维基浏览器 → 本进程不可能有我们留下的 CEF 阻塞，
-        // 直接收工，不再走 5 s 宽限 + 90 s kill 时间线。
-        if (!browserCreated) {
-            log("no wiki browser was ever created this session — disarming directly"
-                + " (no grace period, no kill timer)");
+        // S0-7 门控（t15 升级，T4-F4）：从未创建过维基浏览器时，仅当 JVM 里
+        // 也不存在任何 MCEF/CEF 非守护线程才直接收工——wiki 单装（无 browser
+        // 附属）且 CEF 由其它路径拉起时，MCEF-Shutdown 线程仍可能在退出时挂死
+        // 主 JVM，此时必须保留 5 s 宽限 + 90 s kill 保护线（与 browser 侧
+        // hungCefThreads 同口径）。
+        if (!browserCreated && hungCefThreads() == null) {
+            log("no wiki browser was ever created and no CEF non-daemon threads exist"
+                + " — disarming directly (no grace period, no kill timer)");
             return;
         }
 
@@ -204,8 +216,13 @@ public final class ExitWatchdog {
             try {
                 FMLCommonHandler.instance().exitJava(0, false);
             } catch (Throwable t2) {
-                log("FMLCommonHandler.exitJava failed (" + t2 + "), last resort: direct Runtime.halt (may be FML-redirected to System.exit)");
-                Runtime.getRuntime().halt(0);
+                // t15 (T4-F3)：末档不再直调 Runtime.halt——FML 已在类加载期把本类
+                // 该调用点改写为 System.exit（走 shutdown hooks），钩子卡死时永不
+                // 返回，恰好制造「窗口消失但进程残留」的场景（fml 日志
+                // "REROUTING TO FML" 实锤）。末档失效就明说，交给外部杀手
+                // （ForceExitWatchdog 的 ps1：flag/心跳/deadline 三分支兜底）。
+                log("FMLCommonHandler.exitJava failed (" + t2
+                    + "), all in-process exit paths exhausted — relying on the external killer (ForceExitWatchdog ps1) to terminate the process");
             }
         }
     }
