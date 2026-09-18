@@ -217,15 +217,30 @@ public final class WikiHandle {
         return degraded.toString().trim();
     }
 
-    /** 一次性显眼日志：降级发生时在首帧后输出一次，不刷屏。 */
+    /**
+     * 一次性显眼日志：降级发生时在首帧后输出一次，不刷屏。尾注按缺失通道生成
+     * （t20-W1-04）：缺 setFocus ⇒ 点击/键盘可能被 CEF 整体忽略（不是「降级到
+     * char-only」那么轻，需提示用户先开一次浏览器再开维基）；仅缺 ByKeyCode
+     * 通道 ⇒ 非字符键不可用、char 键仍可用；其余用中性口径。
+     */
     void announceDegraded() {
         if (degradedAnnounced || degraded.length() == 0) {
             return;
         }
         degradedAnnounced = true;
+        String list = degradedNotice();
+        String tail;
+        if (list.contains("setFocus")) {
+            tail = "(probe failed on modern CefBrowserOsr; setFocus missing —"
+                + " page clicks/keys may be entirely ignored: open the browser once, then wiki)";
+        } else if (list.contains("key-by-keycode")) {
+            tail = "(probe failed on modern CefBrowserOsr; non-char keys disabled,"
+                + " char keys still work)";
+        } else {
+            tail = "(probe failed on modern CefBrowserOsr; affected channels only)";
+        }
         System.err.println("[mcphone_wiki] NOTICE: input injection degraded — "
-            + degradedNotice()
-            + "(probe failed on modern CefBrowserOsr; wiki falls back to char-only keys)");
+            + list + tail);
     }
 
     /** 是否存在已探测失败的输入通道（UI 叠加提示用）。 */
@@ -528,7 +543,10 @@ public final class WikiHandle {
         if (injectMouseButton == null) return;
         try {
             injectMouseButton.invoke(browser, x, y, modifiers, button, pressed, clickCount);
-        } catch (Throwable t) {}
+            lastMouseButtonOk = true; // T20-W1-02 诊断：反射层送达内核包装且未抛
+        } catch (Throwable t) {
+            lastMouseButtonOk = false;
+        }
     }
 
     /** rotation 正值=向上滚（与 {@code Mouse.getEventDWheel()} 同号；历史 bug：
@@ -600,5 +618,29 @@ public final class WikiHandle {
         } catch (Throwable t) {
             System.err.println("[mcphone_wiki] setFocus failed: " + t);
         }
+    }
+
+
+    // ===================== T20-W1-02 焦点/点击诊断（与 browser 侧同口径） =====================
+
+    /**
+     * focusProbe：setFocus 反射探测是否成功（armed=true）。内核不公开
+     * {@code hasFocus()}（t20-W1-02：原 diagHasFocus 恒返回 n/a，已废弃），
+     * 这是我们能给出的最接近焦点状况的可读信号。
+     */
+    public boolean focusProbeArmed() {
+        return setFocus != null;
+    }
+
+    /**
+     * lastBtnInvokeOk：最近一次 injectMouseButton 反射调用结果（true=已发出且
+     * 未抛异常；尚无点击=true，无失败证据）。近似语义：只证明 Java 侧调用到达
+     * 内核包装层且未抛异常，不代表 CEF/Blink 真正处理了该点击——判读 E1-E6 时
+     * 勿当作焦点实态。
+     */
+    private volatile boolean lastMouseButtonOk = true;
+
+    public boolean lastMouseButtonInvoked() {
+        return lastMouseButtonOk;
     }
 }

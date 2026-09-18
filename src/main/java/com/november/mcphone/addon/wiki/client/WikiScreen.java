@@ -3,9 +3,6 @@ package com.november.mcphone.addon.wiki.client;
 import org.lwjgl.input.Keyboard;
 import org.lwjgl.input.Mouse;
 
-import java.lang.reflect.Field;
-import java.lang.reflect.Method;
-
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiScreen;
 import net.minecraft.util.StatCollector;
@@ -467,7 +464,7 @@ public class WikiScreen extends GuiScreen {
         switch (keyCode) {
             case 14:  // Backspace
             case 15:  // Tab
-            case 28:  // Enter（小键盘）
+            case 28:  // Return（主键盘；156=小键盘 Enter，remapKeycode 不映射，勿加）
             case 199: // Home
             case 200: // Up
             case 201: // Page Up
@@ -614,7 +611,9 @@ public class WikiScreen extends GuiScreen {
             int mask = toAwtMask(pressedCefBtn);
             // T8：导航后首点一次性诊断（默认开，预算 2 行/实例）——字段供
             // 43 报告 §4 E1-E6 判读：press 是否注入、坐标/视口是否正确、
-            // 是否是「补发 release」救了这次点击
+            // 是否是「补发 release」救了这次点击。focusProbe/lastBtnInvokeOk 为
+            // 焦点近似口径（内核不公开 hasFocus()，t20-W1-02）：反射探测是否
+            // armed + 最近一次按钮注入是否到达反射层
             if (navClickDiag && navClickDiagBudget > 0) {
                 navClickDiag = false;
                 navClickDiagBudget--;
@@ -631,7 +630,8 @@ public class WikiScreen extends GuiScreen {
                     + " mods=" + (mask | awtModifiers())
                     + " viewport=" + cefW + "x" + cefH
                     + " actualViewport=" + b.cefViewWidth() + "x" + b.cefViewHeight()
-                    + " hasFocus=" + diagHasFocus(b));
+                    + " focusProbe=" + (b.focusProbeArmed() ? "armed" : "missing")
+                    + " lastBtnInvokeOk=" + b.lastMouseButtonInvoked());
             }
             // S0-4：注入坐标按 cefW/viewW、cefH/viewH 缩放到 CEF 渲染分辨率；
             // modifiers = 按钮掩码 | 实时修饰键（T6-2）。
@@ -692,25 +692,6 @@ public class WikiScreen extends GuiScreen {
                     + " actualViewport=" + b.cefViewWidth() + "x" + b.cefViewHeight());
             }
             b.injectMouseWheel(cefX(ex), cefY(ey), awtModifiers(), 120, rotation);
-        }
-    }
-
-    /**
-     * T8 诊断：反射穿透 {@link WikiHandle} 的内核包装，探测内核是否有
-     * {@code hasFocus()} 入口并读取。任一环节不成立返回 {@code "n/a"}——只读
-     * 探测，无任何副作用（WikiHandle.java 非 t16 inScope，故不改它，只在
-     * WikiScreen 侧做一次性日志时刻的反射探测）。
-     */
-    private static String diagHasFocus(WikiHandle b) {
-        try {
-            Field f = WikiHandle.class.getDeclaredField("browser");
-            f.setAccessible(true);
-            Object osr = f.get(b);
-            if (osr == null) return "n/a";
-            Method m = osr.getClass().getMethod("hasFocus");
-            return String.valueOf(m.invoke(osr));
-        } catch (Throwable t) {
-            return "n/a";
         }
     }
 
